@@ -848,6 +848,9 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	struct arch_elf_state arch_state = INIT_ARCH_ELF_STATE;
 	struct mm_struct *mm;
 	struct pt_regs *regs;
+	ssize_t num_access_rights;
+	unsigned short int syscall_nr;
+	loff_t access_rights_offset, pos;
 
 	retval = -ENOEXEC;
 	/* First of all, some simple consistency checks */
@@ -1327,17 +1330,15 @@ out_free_interp:
 	ELF_PLAT_INIT(regs, reloc_func_desc);
 #endif
 
-// TODO: This is where we do the setup for access rights (system calls).
-
-    loff_t access_rights_offset = 0;
+    access_rights_offset = 0;
     for (i = 6; i >= 0; i--) {
     	access_rights_offset = access_rights_offset << 8;
     	access_rights_offset += elf_ex->e_ident[9 + i];
     }
     
     if (access_rights_offset != 0) {
-        ssize_t num_access_rights = 0;
-        loff_t pos = access_rights_offset;
+        num_access_rights = 0;
+        pos = access_rights_offset;
 
         if (kernel_read(bprm->file, &num_access_rights, sizeof(num_access_rights), &pos) != sizeof(num_access_rights)) {
             printk("elf_loader: failed to load number of access rights!\n");
@@ -1345,52 +1346,45 @@ out_free_interp:
         }
         access_rights_offset += sizeof(num_access_rights);
         
-        #define NUM_SYS_CALLS 451
+        #define MAX_SYSCALL_NUMBER 450
         // Build the seccomp filter
-        struct sock_filter filter[4 + 2 * NUM_SYS_CALLS + 1];
-        
-        // Validate architecture
-        filter[0] = (struct sock_filter) BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, arch)));
-        filter[1] = (struct sock_filter) BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, AUDIT_ARCH_X86_64, 1, 0);
-	    filter[2] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL);
+        struct sock_filter filter[1 + 2*(MAX_SYSCALL_NUMBER + 1) + 1];
 	    
 	    // Examine system call
-	    filter[3] = (struct sock_filter) BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr)));
+	    filter[0] = (struct sock_filter) BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr)));
         
         // Allow system calls
         for (i = 0; i < num_access_rights; i++) {
-            unsigned short int syscall_nr = 0;
-            loff_t pos = access_rights_offset;
+            syscall_nr = 0;
+            pos = access_rights_offset;
             if (kernel_read(bprm->file, &syscall_nr, sizeof(syscall_nr), &pos) != sizeof(syscall_nr)) {
                 printk("elf_loader: failed to read an access right!\n");
     	        goto out;
             }
+            if (syscall_nr < 0 || syscall_nr > MAX_SYSCALL_NUMBER) {
+                printk("elf_loader: invalid system call number!\n");
+                goto out;
+            }
             access_rights_offset += sizeof(syscall_nr);
             
-            filter[4 + 2*i] = (struct sock_filter) BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall_nr, 0, 1);
-	        filter[4 + 2*i + 1] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW);
+            filter[1 + 2*i] = (struct sock_filter) BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall_nr, 0, 1);
+	        filter[1 + 2*i + 1] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW);
         }
         
         // Kill process if an invalid system call is invoked.
-        filter[4 + 2*num_access_rights] = (struct sock_filter) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA));
-        
-        // TODO: Delete this line again!
-        filter[4] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW);
+        filter[1 + 2*num_access_rights] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL);
         
 	    struct sock_fprog prog = {
-		    .len = (unsigned short)(4 + 2*num_access_rights + 1),
+		    .len = (unsigned short)(1 + 2*num_access_rights + 1),
 		    .filter = filter,
 	    };
-	    
 
+        // Install the seccomp filter.
 		task_set_no_new_privs(current);
-        
-	    if (prctl_set_seccomp(SECCOMP_MODE_FILTER, &prog)) {
+	    if (prctl_set_seccomp(SECCOMP_MODE_FILTER, &prog, false)) {
 		    printk("elf_loader: failed to install seccomp filter\n");
 		    goto out;
 	    }
-	    
-	    printk("elf_loader: installed seccomp filter!\n");
     }
 
 	finalize_exec(bprm);

@@ -632,10 +632,11 @@ static inline void seccomp_sync_threads(unsigned long flags)
 /**
  * seccomp_prepare_filter: Prepares a seccomp filter for use.
  * @fprog: BPF program to install
+ * @from_user: whether the filter is provided by the user. Otherwise, the filter is provided by the kernel.
  *
  * Returns filter on success or an ERR_PTR on failure.
  */
-static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
+static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog, bool from_user)
 {
 	struct seccomp_filter *sfilter;
 	int ret;
@@ -668,8 +669,13 @@ static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
 		return ERR_PTR(-ENOMEM);
 
 	mutex_init(&sfilter->notify_lock);
-	ret = bpf_prog_create_from_user(&sfilter->prog, fprog,
+	if (from_user) {
+	    ret = bpf_prog_create_from_user(&sfilter->prog, fprog,
 					seccomp_check_filter, save_orig);
+	} else {
+	    ret = bpf_prog_create_from_kernel(&sfilter->prog, fprog,
+					seccomp_check_filter, save_orig);
+	}
 	if (ret < 0) {
 		kfree(sfilter);
 		return ERR_PTR(ret);
@@ -683,13 +689,14 @@ static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
 }
 
 /**
- * seccomp_prepare_user_filter - prepares a user-supplied sock_fprog
- * @user_filter: pointer to the user data containing a sock_fprog.
+ * seccomp_prepare_provided_filter - prepares a provided sock_fprog.
+ * @provided_filter: pointer to the data containing a sock_fprog.
+ * @from_user: if the provided filter is from the user. Otherwise, the filter is defined in the kernel.
  *
  * Returns 0 on success and non-zero otherwise.
  */
 static struct seccomp_filter *
-seccomp_prepare_user_filter(const char __user *user_filter)
+seccomp_prepare_provided_filter(const char __user *provided_filter, bool from_user)
 {
 	struct sock_fprog fprog;
 	struct seccomp_filter *filter = ERR_PTR(-EFAULT);
@@ -697,17 +704,22 @@ seccomp_prepare_user_filter(const char __user *user_filter)
 #ifdef CONFIG_COMPAT
 	if (in_compat_syscall()) {
 		struct compat_sock_fprog fprog32;
-		if (copy_from_user(&fprog32, user_filter, sizeof(fprog32)))
+		if (copy_from_user(&fprog32, provided_filter, sizeof(fprog32)))
 			goto out;
 		fprog.len = fprog32.len;
 		fprog.filter = compat_ptr(fprog32.filter);
 	} else /* falls through to the if below. */
 #endif
-	// if (copy_from_user(&fprog, user_filter, sizeof(fprog)))
-	//	goto out;
-	//filter = seccomp_prepare_filter(&((struct sock_fprog)fprog));
-    printk("calling seccomp_prepare_filter!\n");
-    filter = seccomp_prepare_filter((struct sock_fprog *)user_filter);
+
+    if (from_user) {
+        if (copy_from_user(&fprog, provided_filter, sizeof(fprog)))
+	        goto out;
+	    filter = seccomp_prepare_filter(&fprog, from_user);
+    }
+    else {
+        filter = seccomp_prepare_filter((struct sock_fprog *)provided_filter, from_user);
+    }
+
 out:
 	return filter;
 }
@@ -1800,6 +1812,7 @@ static bool has_duplicate_listener(struct seccomp_filter *new_child)
  * seccomp_set_mode_filter: internal function for setting seccomp filter
  * @flags:  flags to change filter behavior
  * @filter: struct sock_fprog containing filter
+ * @from_user: if the filter is from the user. Otherwise, the filter is defined by the kernel.
  *
  * This function may be called repeatedly to install additional filters.
  * Every filter successfully installed will be evaluated (in reverse order)
@@ -1810,7 +1823,7 @@ static bool has_duplicate_listener(struct seccomp_filter *new_child)
  * Returns 0 on success or -EINVAL on failure.
  */
 static long seccomp_set_mode_filter(unsigned int flags,
-				    const char __user *filter)
+				    const char __user *filter, bool from_user)
 {
 	const unsigned long seccomp_mode = SECCOMP_MODE_FILTER;
 	struct seccomp_filter *prepared = NULL;
@@ -1835,7 +1848,7 @@ static long seccomp_set_mode_filter(unsigned int flags,
 		return -EINVAL;
 
 	/* Prepare the new filter before holding any locks. */
-	prepared = seccomp_prepare_user_filter(filter);
+	prepared = seccomp_prepare_provided_filter(filter, from_user);
 	if (IS_ERR(prepared))
 		return PTR_ERR(prepared);
 
@@ -1947,7 +1960,7 @@ static long seccomp_get_notif_sizes(void __user *usizes)
 
 /* Common entry point for both prctl and syscall. */
 static long do_seccomp(unsigned int op, unsigned int flags,
-		       void __user *uargs)
+		       void __user *uargs, bool from_user)
 {
 	switch (op) {
 	case SECCOMP_SET_MODE_STRICT:
@@ -1955,7 +1968,7 @@ static long do_seccomp(unsigned int op, unsigned int flags,
 			return -EINVAL;
 		return seccomp_set_mode_strict();
 	case SECCOMP_SET_MODE_FILTER:
-		return seccomp_set_mode_filter(flags, uargs);
+		return seccomp_set_mode_filter(flags, uargs, from_user);
 	case SECCOMP_GET_ACTION_AVAIL:
 		if (flags != 0)
 			return -EINVAL;
@@ -1974,17 +1987,18 @@ static long do_seccomp(unsigned int op, unsigned int flags,
 SYSCALL_DEFINE3(seccomp, unsigned int, op, unsigned int, flags,
 			 void __user *, uargs)
 {
-	return do_seccomp(op, flags, uargs);
+	return do_seccomp(op, flags, uargs, true);
 }
 
 /**
  * prctl_set_seccomp: configures current->seccomp.mode
  * @seccomp_mode: requested mode to use
  * @filter: optional struct sock_fprog for use with SECCOMP_MODE_FILTER
+ * @from_user: whether the given filter is from the user. Otherwise, the filter is defined in the kernel.
  *
  * Returns 0 on success or -EINVAL on failure.
  */
-long prctl_set_seccomp(unsigned long seccomp_mode, void __user *filter)
+long prctl_set_seccomp(unsigned long seccomp_mode, void __user *filter, bool from_user)
 {
 	unsigned int op;
 	void __user *uargs;
@@ -2008,7 +2022,7 @@ long prctl_set_seccomp(unsigned long seccomp_mode, void __user *filter)
 	}
 
 	/* prctl interface doesn't have flags, so they are always zero. */
-	return do_seccomp(op, 0, uargs);
+	return do_seccomp(op, 0, uargs, from_user);
 }
 
 #if defined(CONFIG_SECCOMP_FILTER) && defined(CONFIG_CHECKPOINT_RESTORE)

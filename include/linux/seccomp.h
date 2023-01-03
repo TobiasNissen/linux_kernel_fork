@@ -51,7 +51,7 @@ extern void secure_computing_strict(int this_syscall);
 #endif
 
 extern long prctl_get_seccomp(void);
-extern long prctl_set_seccomp(unsigned long, void __user *);
+extern long prctl_set_seccomp(unsigned long, void __user *, bool);
 
 static inline int seccomp_mode(struct seccomp *s)
 {
@@ -78,7 +78,7 @@ static inline long prctl_get_seccomp(void)
 	return -EINVAL;
 }
 
-static inline long prctl_set_seccomp(unsigned long arg2, char __user *arg3)
+static inline long prctl_set_seccomp(unsigned long arg2, char __user *arg3, bool from_user)
 {
 	return -EINVAL;
 }
