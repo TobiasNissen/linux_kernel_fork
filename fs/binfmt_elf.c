@@ -850,7 +850,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	struct pt_regs *regs;
 	ssize_t num_access_rights;
 	unsigned short int syscall_nr;
-	loff_t access_rights_offset, pos;
+	loff_t access_right_table_offset, pos;
 
 	retval = -ENOEXEC;
 	/* First of all, some simple consistency checks */
@@ -1330,21 +1330,21 @@ out_free_interp:
 	ELF_PLAT_INIT(regs, reloc_func_desc);
 #endif
 
-    access_rights_offset = 0;
+    access_right_table_offset = 0;
     for (i = 6; i >= 0; i--) {
-    	access_rights_offset = access_rights_offset << 8;
-    	access_rights_offset += elf_ex->e_ident[9 + i];
+    	access_right_table_offset = access_right_table_offset << 8;
+    	access_right_table_offset += elf_ex->e_ident[9 + i];
     }
     
-    if (access_rights_offset != 0) {
+    if (access_right_table_offset != 0) {
         num_access_rights = 0;
-        pos = access_rights_offset;
+        pos = access_right_table_offset;
 
         if (kernel_read(bprm->file, &num_access_rights, sizeof(num_access_rights), &pos) != sizeof(num_access_rights)) {
             printk("elf_loader: failed to load number of access rights!\n");
     	    goto out;
         }
-        access_rights_offset += sizeof(num_access_rights);
+        access_right_table_offset += sizeof(num_access_rights);
         
         #define MAX_SYSCALL_NUMBER 450
         // Build the seccomp filter
@@ -1356,7 +1356,7 @@ out_free_interp:
         // Allow system calls
         for (i = 0; i < num_access_rights; i++) {
             syscall_nr = 0;
-            pos = access_rights_offset;
+            pos = access_right_table_offset;
             if (kernel_read(bprm->file, &syscall_nr, sizeof(syscall_nr), &pos) != sizeof(syscall_nr)) {
                 printk("elf_loader: failed to read an access right!\n");
     	        goto out;
@@ -1365,7 +1365,7 @@ out_free_interp:
                 printk("elf_loader: invalid system call number!\n");
                 goto out;
             }
-            access_rights_offset += sizeof(syscall_nr);
+            access_right_table_offset += sizeof(syscall_nr);
             
             filter[1 + 2*i] = (struct sock_filter) BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall_nr, 0, 1);
 	        filter[1 + 2*i + 1] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW);
